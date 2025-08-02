@@ -1,0 +1,55 @@
+
+services:
+  go-backend:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+    ports:
+      - '3002:3001'  # API port
+      - '4003-5000:3003-4000'  # Project ports range
+    env_file: '.env.local'
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./projects:/projects
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    profiles:
+      - production
+
+  frontend:
+    build:
+      context: .
+      dockerfile: ./frontend/Dockerfile
+    ports:
+      - '5173:5173'
+    env_file: './.env.local'
+    environment:
+      - VITE_API_URL=http://go-backend:3001
+      - VITE_HOST=0.0.0.0
+      - VITE_LOG_LEVEL=${VITE_LOG_LEVEL:-debug}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - HuggingFace_API_KEY=${HuggingFace_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPEN_ROUTER_API_KEY=${OPEN_ROUTER_API_KEY}
+      - GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY}
+      - OLLAMA_API_BASE_URL=${OLLAMA_API_BASE_URL}
+      - XAI_API_KEY=${XAI_API_KEY}
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY}
+      - TOGETHER_API_BASE_URL=${TOGETHER_API_BASE_URL}
+      - AWS_BEDROCK_CONFIG=${AWS_BEDROCK_CONFIG}
+      - LOG_LEVEL=${VITE_LOG_LEVEL:-debug}
+      - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-32768}
+    depends_on:
+      - go-backend
+    profiles:
+      - production
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  
