@@ -6,125 +6,116 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/docker/docker/client"
 )
 
-// Request/Response types
-type (
-	StartProjectRequest struct {
-		ProjectID string `json:"projectId"`
-	}
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "3600")
 
-	StartProjectResponse struct {
-		ContainerID string            `json:"containerId"`
-		Status      string            `json:"status"`
-		Message     string            `json:"message,omitempty"`
-		Ports       map[string]string `json:"ports,omitempty"`
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next(w, r)
 	}
-)
+}
 
 func main() {
-	// Initialize Docker client with retry logic
-	var manager *ContainerManager
-	var err error
-
-	// Retry Docker connection with backoff
-	maxRetries := 3
-	for i := 0; i < maxRetries; i++ {
-		manager, err = NewContainerManager()
-		if err == nil {
-			break
-		}
-
-		if i == maxRetries-1 {
-			log.Fatalf("Failed to initialize Docker client after %d attempts: %v", maxRetries, err)
-		}
-
-		waitTime := time.Duration(i+1) * time.Second
-		log.Printf("Docker connection failed (attempt %d/%d), retrying in %v...", i+1, maxRetries, waitTime)
-		time.Sleep(waitTime)
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		log.Fatal("Failed to create Docker client:", err)
 	}
 
-	// Verify Docker is actually running
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if _, err := manager.cli.Ping(ctx); err != nil {
-		log.Fatalf("Docker daemon not responding: %v", err)
+	manager := &ContainerManager{
+		cli:           dockerClient,
+		containerInfo: make(map[string]*ContainerInfo),
 	}
 
-	// Cleanup stale containers (non-critical operation)
-	if err := manager.cleanupExisting(context.Background(), ""); err != nil {
-		log.Printf("Container cleanup warning: %v (continuing anyway)", err)
-	}
-
-	// Add health check endpoints before other handlers
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	http.HandleFunc("/health/docker", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		if _, err := manager.cli.Ping(ctx); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{
-				"status":  "unhealthy",
-				"error":   err.Error(),
-				"message": "Docker daemon not available",
-			})
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "healthy",
-			"version": "1.0",
-		})
-	})
-
-	http.HandleFunc("/api/projects/start", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Received /api/projects/start request")
-
+	// Existing endpoints
+	http.HandleFunc("/api/projects/start", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			log.Println("Rejected non-POST request to /api/projects/start")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
 			return
 		}
 
-		var req StartProjectRequest
+		var req struct {
+			ProjectID string `json:"projectId"`
+		}
+
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			log.Printf("Failed to parse request body: %v\n", err)
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
 			return
 		}
-		log.Printf("Starting project with ID: %s\n", req.ProjectID)
 
-		resp, err := manager.CreateAndStart(req.ProjectID)
-		if err != nil {
-			log.Printf("Failed to create/start container: %v\n", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if req.ProjectID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Project ID is required"})
 			return
 		}
-		log.Printf("Container started: %s\n", resp.ContainerID)
+
+		response, err := manager.CreateAndStart(req.ProjectID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			log.Printf("Failed to encode response: %v\n", err)
-		} else {
-			log.Printf("Response sent for project %s (container %s)\n", req.ProjectID, resp.ContainerID)
+		json.NewEncoder(w).Encode(response)
+	}))
+
+	// New container status endpoint
+	http.HandleFunc("/api/containers/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			return
 		}
-	})
 
-	// WebSocket endpoint
-	http.HandleFunc("/ws", handleWebSocket)
+		var req struct {
+			ContainerID string `json:"containerId"`
+		}
 
-	log.Println("Starting server on :3001")
-	log.Println("Health checks available at /health and /health/docker")
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		inspect, err := manager.cli.ContainerInspect(ctx, req.ContainerID)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Container not found"})
+			return
+		}
+
+		status := "stopped"
+		if inspect.State.Running {
+			status = "running"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"containerId": req.ContainerID,
+			"status":      status,
+			"ports":       inspect.NetworkSettings.Ports,
+		})
+	}))
+
+	// WebSocket endpoint (your existing implementation)
+	http.HandleFunc("/ws", corsMiddleware(handleWebSocket))
+
+	log.Println("Server starting on :3001")
 	log.Fatal(http.ListenAndServe(":3001", nil))
 }

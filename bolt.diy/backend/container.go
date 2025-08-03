@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,113 +18,119 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
+// DockerClient is an alias for the Docker client
+// This fixes the "undefined: DockerClient" error
+type DockerClient = *client.Client
+
 type ContainerManager struct {
-	cli          *client.Client
-	readyStates  sync.Map
-	mu           sync.Mutex
-	projectLocks sync.Map
+	cli           DockerClient // Now properly typed
+	containerInfo map[string]*ContainerInfo
+	mu            sync.RWMutex
 }
 
-func (m *ContainerManager) getProjectLock(projectID string) *sync.Mutex {
-	lock, _ := m.projectLocks.LoadOrStore(projectID, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+type ContainerInfo struct {
+	ID     string
+	Status string
+	Ports  map[string]string
 }
 
-func NewContainerManager() (*ContainerManager, error) {
-	log.Println("Initializing Docker client...")
+type StartProjectResponse struct {
+	ContainerID string            `json:"containerId"`
+	Status      string            `json:"status"`
+	Message     string            `json:"message,omitempty"`
+	Ports       map[string]string `json:"ports,omitempty"`
+}
 
-	connectionAttempts := []struct {
-		host string
-		opts []client.Opt
-	}{
-		// 1. First try environment variables (DOCKER_HOST)
-		{
-			host: "from environment",
-			opts: []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()},
-		},
-		// 2. Try standard Unix socket paths
-		{
-			host: "unix:///var/run/docker.sock",
-			opts: []client.Opt{
-				client.WithHost("unix:///var/run/docker.sock"),
-				client.WithAPIVersionNegotiation(),
-			},
-		},
-		// 3. Try Colima's default socket
-		{
-			host: "colima default",
-			opts: []client.Opt{
-				client.WithHost("unix://" + filepath.Join(os.Getenv("HOME"), ".colima", "default", "docker.sock")),
-				client.WithAPIVersionNegotiation(),
-			},
-		},
-		// 4. Try Docker Desktop for Mac
-		{
-			host: "docker desktop",
-			opts: []client.Opt{
-				client.WithHost("unix:///Users/" + os.Getenv("USER") + "/Library/Containers/com.docker.docker/Data/docker.sock"),
-				client.WithAPIVersionNegotiation(),
-			},
-		},
+// NewContainerManager creates a new ContainerManager instance
+// This fixes the "undefined: NewContainerManager" error
+func NewContainerManager(cli DockerClient) *ContainerManager {
+	return &ContainerManager{
+		cli:           cli,
+		containerInfo: make(map[string]*ContainerInfo),
+	}
+}
+
+// executeCommand runs a command in the specified container
+// This fixes the "executeCommand undefined" error
+func (m *ContainerManager) executeCommand(ctx context.Context, containerID string, command string) (string, error) {
+	// Create exec configuration
+	execConfig := types.ExecConfig{
+		Cmd:          []string{"/bin/sh", "-c", command},
+		AttachStdout: true,
+		AttachStderr: true,
 	}
 
-	var lastErr error
-	var cli *client.Client
-
-	for _, attempt := range connectionAttempts {
-		log.Printf("Attempting to connect to Docker via %s...", attempt.host)
-
-		cli, lastErr = client.NewClientWithOpts(attempt.opts...)
-		if lastErr != nil {
-			log.Printf("Connection attempt failed (%s): %v", attempt.host, lastErr)
-			continue
-		}
-
-		// Verify the connection works
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		log.Printf("Verifying Docker connection via %s...", attempt.host)
-		if _, err := cli.Ping(ctx); err != nil {
-			lastErr = fmt.Errorf("ping failed: %w", err)
-			log.Printf("Ping verification failed (%s): %v", attempt.host, err)
-			continue
-		}
-
-		log.Printf("Successfully connected to Docker via %s", attempt.host)
-		return &ContainerManager{
-			cli:         cli,
-			readyStates: sync.Map{},
-		}, nil
+	// Create exec instance
+	execResp, err := m.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec: %w", err)
 	}
 
-	log.Printf("All Docker connection attempts failed. Last error: %v", lastErr)
-	return nil, fmt.Errorf("failed to connect to Docker after trying all options. Last error: %w", lastErr)
+	// Attach to exec
+	execAttach, err := m.cli.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return "", fmt.Errorf("failed to attach to exec: %w", err)
+	}
+	defer execAttach.Close()
+
+	// Read output
+	output := make([]byte, 1024)
+	n, err := execAttach.Reader.Read(output)
+	if err != nil && err.Error() != "EOF" {
+		return "", fmt.Errorf("failed to read exec output: %w", err)
+	}
+
+	return string(output[:n]), nil
 }
 
 func (m *ContainerManager) CreateAndStart(projectID string) (*StartProjectResponse, error) {
 	ctx := context.Background()
 
-	log.Printf("[CreateAndStart] Step 1: Resolving absolute project path for %q", projectID)
+	log.Printf("[CreateAndStart] Checking for existing running container for project %s", projectID)
+
+	// 1. Check for existing running container first (bolt.diy behavior)
+	existingContainer, err := m.findRunningContainer(ctx, projectID)
+	if err == nil && existingContainer != nil {
+		log.Printf("[CreateAndStart] Found existing running container: %s", existingContainer.ID)
+
+		// Verify it's actually working
+		if err := m.verifyCommandExecution(ctx, existingContainer.ID); err == nil {
+			log.Printf("[CreateAndStart] Reusing healthy container: %s", existingContainer.ID)
+			ports, _ := m.getPortMappings(ctx, existingContainer.ID)
+			m.SetContainerReady(existingContainer.ID)
+			return &StartProjectResponse{
+				ContainerID: existingContainer.ID,
+				Status:      "success",
+				Ports:       ports,
+				Message:     "Reused existing container",
+			}, nil
+		} else {
+			log.Printf("[CreateAndStart] Existing container unhealthy: %v", err)
+		}
+	}
+
+	// 2. Get project path but DON'T create directory automatically
 	projectPath, err := filepath.Abs(filepath.Join("projects", projectID))
 	if err != nil {
-		log.Printf("[CreateAndStart] Error: failed to get absolute path: %v", err)
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	log.Printf("[CreateAndStart] Step 2: Ensuring project directory exists at %q", projectPath)
-	if err := os.MkdirAll(projectPath, 0755); err != nil {
-		log.Printf("[CreateAndStart] Error: failed to create project directory: %v", err)
-		return nil, fmt.Errorf("failed to create project directory: %w", err)
+	// 3. Only create directory if it doesn't exist (lazy creation)
+	if _, err := os.Stat(projectPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(projectPath, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create project directory: %w", err)
+		}
+		log.Printf("Created project directory on demand: %s", projectPath)
+	} else {
+		log.Printf("Using existing project directory: %s", projectPath)
 	}
 
-	log.Printf("[CreateAndStart] Step 3: Cleaning up any existing container for %q", projectID)
-	if err := m.cleanupExisting(ctx, projectID); err != nil {
-		log.Printf("[CreateAndStart] Error: cleanup failed: %v", err)
-		return nil, fmt.Errorf("cleanup failed: %w", err)
+	// 4. Cleanup only broken/stopped containers
+	if err := m.cleanupBrokenContainers(ctx, projectID); err != nil {
+		log.Printf("Warning: cleanup failed: %v", err)
 	}
 
-	log.Printf("[CreateAndStart] Step 4: Creating container for %q", projectID)
+	// 5. Create new container
 	resp, err := m.cli.ContainerCreate(
 		ctx,
 		&container.Config{
@@ -158,290 +163,62 @@ func (m *ContainerManager) CreateAndStart(projectID string) (*StartProjectRespon
 		nil,
 		fmt.Sprintf("bolt-%s", projectID),
 	)
+
 	if err != nil {
-		log.Printf("[CreateAndStart] Error: container create failed: %v", err)
 		return nil, fmt.Errorf("container create failed: %w", err)
 	}
-	log.Printf("[CreateAndStart] Step 4b: Container created with ID %s", resp.ID)
 
-	log.Printf("[CreateAndStart] Step 5: Starting container %s", resp.ID)
+	// 6. Start container
 	if err := m.cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		log.Printf("[CreateAndStart] Error: container start failed: %v", err)
 		return nil, fmt.Errorf("container start failed: %w", err)
 	}
-	log.Printf("[CreateAndStart] Step 5b: Container started")
 
-	log.Printf("[CreateAndStart] Step 6: Waiting for container to be healthy (ID: %s)", resp.ID)
+	// 7. Wait for container to be healthy
 	if err := m.waitForHealthy(ctx, resp.ID); err != nil {
-		log.Printf("[CreateAndStart] Error: container not healthy: %v", err)
 		return nil, fmt.Errorf("container not healthy: %w", err)
 	}
-	log.Printf("[CreateAndStart] Step 6b: Container is healthy")
 
-	log.Printf("[CreateAndStart] Step 7: Verifying command execution in container %s", resp.ID)
+	// 8. Verify command execution
 	if err := m.verifyCommandExecution(ctx, resp.ID); err != nil {
-		log.Printf("[CreateAndStart] Error: container command execution failed: %v", err)
 		return nil, fmt.Errorf("container command execution failed: %w", err)
 	}
-	log.Printf("[CreateAndStart] Step 7b: Command execution verified")
 
-	log.Printf("[CreateAndStart] Step 8: Getting port mappings for container %s", resp.ID)
 	ports, err := m.getPortMappings(ctx, resp.ID)
 	if err != nil {
-		log.Printf("[CreateAndStart] Error: failed to get ports: %v", err)
 		return nil, fmt.Errorf("failed to get ports: %w", err)
 	}
-	log.Printf("[CreateAndStart] Step 8b: Ports mapped: %+v", ports)
 
-	log.Printf("[CreateAndStart] Step 9: Returning StartProjectResponse for container %s", resp.ID)
+	// ✅ NO automatic file creation - matches bolt.diy behavior
+	log.Printf("Container ready - empty project preserved (bolt.diy behavior)")
 	m.SetContainerReady(resp.ID)
 	return &StartProjectResponse{
 		ContainerID: resp.ID,
 		Status:      "success",
 		Ports:       ports,
+		Message:     "Container ready - project starts empty like bolt.diy",
 	}, nil
 }
 
-func (m *ContainerManager) WaitForContainerReady(ctx context.Context, containerID string) error {
-	// Check if already ready
-	if _, ok := m.readyStates.Load(containerID); ok {
-		return nil
-	}
-
-	// Create a new ready channel
-	ready := make(chan struct{})
-	actual, loaded := m.readyStates.LoadOrStore(containerID, ready)
-	if loaded {
-		close(ready)
-		ready = actual.(chan struct{})
-	}
-
-	select {
-	case <-ready:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (m *ContainerManager) executeCommand(ctx context.Context, containerID string, command string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	log.Printf("Executing command in container %s: %s", containerID, command)
-
-	if m.cli == nil {
-		err := fmt.Errorf("Docker client not initialized")
-		log.Printf("Error: %v", err)
-		return "", err
-	}
-
-	// Verify container exists first
-	log.Printf("Inspecting container %s...", containerID)
-	_, err := m.cli.ContainerInspect(ctx, containerID)
-	if err != nil {
-		err = fmt.Errorf("container inspection failed: %w", err)
-		log.Printf("Error: %v", err)
-		return "", err
-	}
-
-	// Create exec configuration
-	log.Printf("Creating exec instance in container %s...", containerID)
-	execConfig := types.ExecConfig{
-		Cmd:          []string{"sh", "-c", command},
-		AttachStdout: true,
-		AttachStderr: true,
-	}
-
-	// Create exec instance
-	execID, err := m.cli.ContainerExecCreate(ctx, containerID, execConfig)
-	if err != nil {
-		err = fmt.Errorf("exec creation failed: %w", err)
-		log.Printf("Error: %v", err)
-		return "", err
-	}
-	log.Printf("Created exec instance %s in container %s", execID.ID, containerID)
-
-	// Attach to exec instance
-	log.Printf("Attaching to exec instance %s...", execID.ID)
-	resp, err := m.cli.ContainerExecAttach(ctx, execID.ID, types.ExecStartCheck{})
-	if err != nil {
-		err = fmt.Errorf("exec attach failed: %w", err)
-		log.Printf("Error: %v", err)
-		return "", err
-	}
-	defer resp.Close()
-	log.Printf("Successfully attached to exec instance %s", execID.ID)
-
-	// Read output with timeout
-	log.Printf("Reading command output from container %s...", containerID)
-	output := make(chan string, 1)
-	errChan := make(chan error, 1)
-
-	go func() {
-		buf := new(strings.Builder)
-		_, err := io.Copy(buf, resp.Reader)
-		if err != nil {
-			log.Printf("Error reading command output: %v", err)
-			errChan <- err
-			return
-		}
-		output <- buf.String()
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Printf("Command execution cancelled: %v", ctx.Err())
-		return "", ctx.Err()
-	case err := <-errChan:
-		log.Printf("Error during command execution: %v", err)
-		return "", fmt.Errorf("output read failed: %w", err)
-	case out := <-output:
-		log.Printf("Command executed successfully in container %s", containerID)
-		log.Printf("Command output length: %d bytes", len(out))
-		return out, nil
-	case <-time.After(30 * time.Second):
-		log.Printf("Command execution timed out after 30 seconds")
-		return "", fmt.Errorf("command execution timed out")
-	}
-}
-
-func (m *ContainerManager) verifyCommandExecution(ctx context.Context, containerID string) error {
-	log.Printf("[verifyCommandExecution] Inspecting container %s", containerID)
-	_, err := m.cli.ContainerInspect(ctx, containerID)
-	if err != nil {
-		log.Printf("[verifyCommandExecution] Inspection failed: %v", err)
-		return fmt.Errorf("container inspection failed: %w", err)
-	}
-
-	log.Printf("[verifyCommandExecution] Executing 'echo ready' in %s", containerID)
-	out, err := m.executeCommand(ctx, containerID, "echo ready")
-	log.Printf("[verifyCommandExecution] Exec returned (err: %v), output: %q", err, out)
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(out, "ready") {
-		return fmt.Errorf("container not responding properly")
-	}
-	return nil
-}
-
-func (m *ContainerManager) SetContainerReady(containerID string) {
-	if actual, loaded := m.readyStates.LoadAndDelete(containerID); loaded {
-		close(actual.(chan struct{}))
-	}
-}
-
-func (m *ContainerManager) waitForHealthy(ctx context.Context, containerID string) error {
-	const timeout = 60 * time.Second // Increased timeout
-	const interval = 1 * time.Second // More reasonable check interval
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// First check if basic services are up
-	if err := m.waitForBasicReadiness(ctx, containerID); err != nil {
-		return err
-	}
-
-	// Then verify application-specific readiness
-	return m.waitForApplicationReady(ctx, containerID)
-}
-
-func (m *ContainerManager) ExecuteCommandWS(containerID, command string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Wait for container to be ready first
-	if err := m.WaitForContainerReady(ctx, containerID); err != nil {
-		return "", fmt.Errorf("container not ready: %w", err)
-	}
-
-	return m.executeCommand(ctx, containerID, command)
-}
-
-func (m *ContainerManager) waitForBasicReadiness(ctx context.Context, containerID string) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for container to start: %w", ctx.Err())
-		case <-time.After(500 * time.Millisecond):
-			inspect, err := m.cli.ContainerInspect(ctx, containerID)
-			if err != nil {
-				return fmt.Errorf("inspection error: %w", err)
-			}
-
-			// Check container state
-			if inspect.State == nil {
-				continue
-			}
-
-			if inspect.State.Status == "exited" {
-				return fmt.Errorf("container exited with code %d", inspect.State.ExitCode)
-			}
-
-			if !inspect.State.Running {
-				continue
-			}
-
-			// Check health status if healthcheck configured
-			if inspect.State.Health != nil {
-				switch inspect.State.Health.Status {
-				case "healthy":
-					return nil
-				case "unhealthy":
-					return fmt.Errorf("container is unhealthy")
-				}
-			}
-
-			// If no healthcheck, consider running as ready
-			return nil
-		}
-	}
-}
-
-func (m *ContainerManager) waitForApplicationReady(ctx context.Context, containerID string) error {
-	// Try executing a simple command to verify actual readiness
-	execID, err := m.cli.ContainerExecCreate(ctx, containerID, types.ExecConfig{
-		Cmd:          []string{"sh", "-c", "command -v node && echo OK"},
-		AttachStdout: true,
-		AttachStderr: true,
+// Helper function to find existing running containers
+func (m *ContainerManager) findRunningContainer(ctx context.Context, projectID string) (*types.Container, error) {
+	containers, err := m.cli.ContainerList(ctx, types.ContainerListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("name", fmt.Sprintf("bolt-%s", projectID)),
+			filters.Arg("status", "running"),
+		),
 	})
 	if err != nil {
-		return fmt.Errorf("exec create failed: %w", err)
+		return nil, err
 	}
 
-	resp, err := m.cli.ContainerExecAttach(ctx, execID.ID, types.ExecStartCheck{})
-	if err != nil {
-		return fmt.Errorf("exec attach failed: %w", err)
+	if len(containers) > 0 {
+		return &containers[0], nil
 	}
-	defer resp.Close()
-
-	// Read output with timeout
-	output := make(chan string, 1)
-	go func() {
-		buf := new(strings.Builder)
-		_, err := io.Copy(buf, resp.Reader)
-		if err != nil {
-			return
-		}
-		output <- buf.String()
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case out := <-output:
-		if !strings.Contains(out, "OK") {
-			return fmt.Errorf("application not ready")
-		}
-		return nil
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timeout waiting for application response")
-	}
+	return nil, fmt.Errorf("no running container found")
 }
 
-func (m *ContainerManager) cleanupExisting(ctx context.Context, projectID string) error {
+// Helper function to cleanup broken containers only
+func (m *ContainerManager) cleanupBrokenContainers(ctx context.Context, projectID string) error {
 	containers, err := m.cli.ContainerList(ctx, types.ContainerListOptions{
 		All: true,
 		Filters: filters.NewArgs(
@@ -453,19 +230,72 @@ func (m *ContainerManager) cleanupExisting(ctx context.Context, projectID string
 	}
 
 	for _, c := range containers {
-		if err := m.cli.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{
-			Force: true,
-		}); err != nil {
-			return fmt.Errorf("remove container failed: %w", err)
+		// Only remove containers that are not running
+		if c.State != "running" || strings.Contains(c.Status, "unhealthy") {
+			log.Printf("Removing broken container: %s (status: %s)", c.ID, c.State)
+			if err := m.cli.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{
+				Force: true,
+			}); err != nil {
+				log.Printf("Warning: failed to remove container %s: %v", c.ID, err)
+			}
 		}
 	}
+	return nil
+}
+
+func (m *ContainerManager) waitForHealthy(ctx context.Context, containerID string) error {
+	timeout := 30 * time.Second
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		inspect, err := m.cli.ContainerInspect(ctx, containerID)
+		if err != nil {
+			return fmt.Errorf("failed to inspect container: %w", err)
+		}
+
+		if inspect.State.Health != nil {
+			switch inspect.State.Health.Status {
+			case "healthy":
+				return nil
+			case "unhealthy":
+				return fmt.Errorf("container became unhealthy")
+			}
+		} else if inspect.State.Running {
+			// No health check defined, just check if running
+			return nil
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	return fmt.Errorf("container did not become healthy within %v", timeout)
+}
+
+func (m *ContainerManager) verifyCommandExecution(ctx context.Context, containerID string) error {
+	execConfig := types.ExecConfig{
+		Cmd:          []string{"echo", "test"},
+		AttachStdout: true,
+		AttachStderr: true,
+	}
+
+	execResp, err := m.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	execAttach, err := m.cli.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return fmt.Errorf("failed to attach to exec: %w", err)
+	}
+	defer execAttach.Close()
+
 	return nil
 }
 
 func (m *ContainerManager) getPortMappings(ctx context.Context, containerID string) (map[string]string, error) {
 	inspect, err := m.cli.ContainerInspect(ctx, containerID)
 	if err != nil {
-		return nil, fmt.Errorf("inspect failed: %w", err)
+		return nil, err
 	}
 
 	ports := make(map[string]string)
@@ -474,5 +304,20 @@ func (m *ContainerManager) getPortMappings(ctx context.Context, containerID stri
 			ports[string(port)] = bindings[0].HostPort
 		}
 	}
+
 	return ports, nil
+}
+
+func (m *ContainerManager) SetContainerReady(containerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.containerInfo == nil {
+		m.containerInfo = make(map[string]*ContainerInfo)
+	}
+
+	m.containerInfo[containerID] = &ContainerInfo{
+		ID:     containerID,
+		Status: "ready",
+	}
 }

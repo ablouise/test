@@ -2,65 +2,32 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"sync"
 
+	"github.com/docker/docker/client"
 	"github.com/gorilla/websocket"
 )
 
-var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
-	connMutex   sync.Mutex
-	activeConns = make(map[string]*websocket.Conn)
-)
-
-type CommandRequest struct {
-	MessageID   string `json:"messageId"`
-	ContainerID string `json:"containerId"`
-	Command     string `json:"command"`
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for development
+	},
 }
 
-type CommandResponse struct {
-	Type      string `json:"type"`
-	Data      string `json:"data"`
-	MessageID string `json:"messageId,omitempty"`
-}
-
+// Global container manager variable
 var containerManager *ContainerManager
 
+// Initialize the container manager
 func init() {
-	var err error
-	containerManager, err = NewContainerManager()
+	// Create Docker client first
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
-		log.Fatalf("Failed to create container manager: %v", err)
-	}
-}
-
-func executeCommand(conn *websocket.Conn, cmdReq CommandRequest) {
-	ctx := context.Background()
-
-	// Use containerManager instead of dockerCli
-	out, err := containerManager.executeCommand(ctx, cmdReq.ContainerID, cmdReq.Command)
-	if err != nil {
-		sendError(conn, err.Error(), cmdReq.MessageID)
-		return
+		log.Fatal("Failed to create Docker client:", err)
 	}
 
-	sendResponse(conn, CommandResponse{
-		Type:      "output",
-		Data:      out,
-		MessageID: cmdReq.MessageID,
-	})
-
-	sendResponse(conn, CommandResponse{
-		Type:      "end",
-		MessageID: cmdReq.MessageID,
-	})
+	// Create container manager with the Docker client
+	containerManager = NewContainerManager(dockerClient)
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -71,55 +38,37 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	connMutex.Lock()
-	connID := fmt.Sprintf("%p", conn)
-	activeConns[connID] = conn
-	connMutex.Unlock()
-
-	remoteAddr := conn.RemoteAddr().String()
-	log.Printf("WebSocket connected: %s", remoteAddr)
-
-	defer func() {
-		connMutex.Lock()
-		delete(activeConns, connID)
-		connMutex.Unlock()
-		log.Printf("WebSocket disconnected: %s", remoteAddr)
-	}()
-
 	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err) {
-				log.Printf("WebSocket unexpected close: %v", err)
-			}
+		var msg struct {
+			MessageID   string `json:"messageId"`
+			ContainerID string `json:"containerId"`
+			Command     string `json:"command"`
+		}
+
+		if err := conn.ReadJSON(&msg); err != nil {
+			log.Printf("WebSocket read error: %v", err)
 			break
 		}
 
-		var cmdReq CommandRequest
-		if err := json.Unmarshal(msg, &cmdReq); err != nil {
-			sendError(conn, "invalid command format", "")
-			continue
+		// Now executeCommand will work properly
+		output, err := containerManager.executeCommand(context.Background(), msg.ContainerID, msg.Command)
+
+		response := map[string]interface{}{
+			"messageId": msg.MessageID,
+			"type":      "output",
+			"data":      output,
 		}
 
-		log.Printf("Executing command: %s (Container: %s)", cmdReq.Command, cmdReq.ContainerID)
-		go executeCommand(conn, cmdReq)
+		if err != nil {
+			response["type"] = "error"
+			response["data"] = err.Error()
+		}
+
+		// Send end signal
+		response["type"] = "end"
+		if err := conn.WriteJSON(response); err != nil {
+			log.Printf("WebSocket write error: %v", err)
+			break
+		}
 	}
-}
-
-func sendResponse(conn *websocket.Conn, resp CommandResponse) {
-	connMutex.Lock()
-	defer connMutex.Unlock()
-
-	if err := conn.WriteJSON(resp); err != nil {
-		log.Printf("WebSocket write error: %v", err)
-	}
-}
-
-func sendError(conn *websocket.Conn, message string, messageID string) {
-	log.Printf("Sending error response: %s (MessageID: %s)", message, messageID)
-	sendResponse(conn, CommandResponse{
-		Type:      "error",
-		Data:      message,
-		MessageID: messageID,
-	})
 }
