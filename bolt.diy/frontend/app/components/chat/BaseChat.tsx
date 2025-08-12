@@ -33,6 +33,7 @@ import { ChatBox } from './ChatBox';
 import type { DesignScheme } from '~/types/design-scheme';
 import type { ElementInfo } from '~/components/workbench/Inspector';
 import LlmErrorAlert from './LLMApiAlert';
+import { generateProjectId } from '~/utils/projectId';
 
 const TEXTAREA_MIN_HEIGHT = 76;
 
@@ -263,7 +264,14 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
     };
 
     const handleSendMessage = (event: React.UIEvent, messageInput?: string) => {
-      if (sendMessage) {
+      if (sendMessage && messageInput?.trim()) {
+        const projectId = generateProjectId();
+
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('currentProjectId', projectId);
+        }
+
+        console.log('Generated project ID:', projectId); // Add this debug log
         sendMessage(event, messageInput);
         setSelectedElement?.(null);
 

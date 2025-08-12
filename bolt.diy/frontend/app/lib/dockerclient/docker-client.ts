@@ -1,3 +1,4 @@
+// app/lib/dockerclient/docker-client.ts
 import { WORK_DIR } from '~/utils/constants';
 import { EventEmitter } from 'events';
 
@@ -62,17 +63,22 @@ export class DockerClient extends EventEmitter {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ containerId }),
         });
-
+        
         if (!response.ok) {
           return false;
         }
-
+        
         const data: unknown = await response.json();
-
-        if (typeof data === 'object' && data !== null && 'status' in data && typeof (data as any).status === 'string') {
+        
+        if (
+          typeof data === 'object' && 
+          data !== null && 
+          'status' in data && 
+          typeof (data as any).status === 'string'
+        ) {
           return (data as { status: string }).status === 'running';
         }
-
+        
         return false;
       } catch (error) {
         console.error('Container validation failed:', error);
@@ -81,7 +87,7 @@ export class DockerClient extends EventEmitter {
     })();
 
     this._containerValidation.set(containerId, validationPromise);
-
+    
     setTimeout(() => {
       this._containerValidation.delete(containerId);
     }, 30000);
@@ -92,7 +98,6 @@ export class DockerClient extends EventEmitter {
   async startProject(projectId: string): Promise<IStartProjectResponse> {
     if (this._currentProjectId === projectId && this._currentContainerId) {
       const isValid = await this._validateContainer(this._currentContainerId);
-
       if (isValid) {
         console.info(`Reusing existing container for project ${projectId}: ${this._currentContainerId}`);
         return {
@@ -185,8 +190,8 @@ export class DockerClient extends EventEmitter {
   }
 
   private async _verifyContainerReady(): Promise<void> {
-    const maxAttempts = 30;
-    const delay = 1000;
+    const maxAttempts = 60; // Increased timeout
+    const delay = 2000;     // Increased delay
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -473,7 +478,9 @@ export class DockerClient extends EventEmitter {
       const base64Content = Buffer.from(content).toString('base64');
       await this.executeCommand(`echo '${base64Content}' | base64 -d > "${path}"`);
     } else {
-      await this.executeCommand(`printf '%s' '${this._escapeShellContent(content)}' > "${path}"`);
+      // ✅ FIXED: Better content escaping for special characters
+      const escapedContent = content.replace(/'/g, `'"'"'`);
+      await this.executeCommand(`printf '%s' '${escapedContent}' > "${path}"`);
     }
   }
 
@@ -481,12 +488,15 @@ export class DockerClient extends EventEmitter {
     await this.ensureContainerReady();
 
     try {
-      const lsOutput = await this.executeCommand(`ls -la "${dirPath}" | awk '{print $1,$9}' | tail -n +2`);
+      // ✅ FIXED: Use BusyBox-compatible ls command
+      const lsOutput = await this.executeCommand(`ls -la "${dirPath}" 2>/dev/null | tail -n +2 | grep -v '^total'`);
       return lsOutput
         .split('\n')
         .filter((line) => line.trim())
         .map((line) => {
-          const [perms, name] = line.split(' ');
+          const parts = line.trim().split(/\s+/);
+          const perms = parts[0];
+          const name = parts.slice(8).join(' '); // Handle filenames with spaces
           return {
             name,
             type: perms.startsWith('d') ? ('directory' as const) : ('file' as const),
@@ -541,6 +551,8 @@ export class DockerClient extends EventEmitter {
 
     const watchId = crypto.randomUUID();
     const pollInterval = options.pollInterval || 5000;
+    
+    // ✅ FIXED: Use BusyBox-compatible find commands
     const includePatterns = options.include.map((p) => p.replace(`${WORK_DIR}/`, '/app/'));
     const excludePatterns = options.exclude || ['**/node_modules/**', '**/.git/**'];
 
@@ -562,12 +574,27 @@ export class DockerClient extends EventEmitter {
           await this.connect();
         }
 
-        const findCmd = [
-          'find /app -type f',
-          ...includePatterns.map((p) => `-path "${p}"`),
-          ...excludePatterns.map((p) => `! -path "${p}"`),
-          '-printf "%T@ %p\\n"',
-        ].join(' ');
+        // ✅ FIXED: Use BusyBox-compatible find command instead of -printf
+        let findCmd = 'find /app -type f';
+        
+        // Add include patterns (convert glob patterns to find-compatible)
+        if (includePatterns.length > 0) {
+          const namePatterns = includePatterns.map(p => {
+            // Convert **/*.js to -name "*.js"
+            const ext = p.split('*').pop();
+            return `-name "*${ext}"`;
+          }).join(' -o ');
+          findCmd += ` \\( ${namePatterns} \\)`;
+        }
+        
+        // Add exclude patterns
+        for (const exclude of excludePatterns) {
+          const excludePath = exclude.replace('**/', '*/').replace('/**', '/*');
+          findCmd += ` ! -path "${excludePath}"`;
+        }
+        
+        // ✅ Use stat instead of -printf
+        findCmd += ' -exec stat -c "%Y %n" {} \\;';
 
         const output = await this.executeCommand(findCmd);
         const currentFiles: Record<string, { mtime: number; content?: string }> = {};
@@ -627,7 +654,8 @@ export class DockerClient extends EventEmitter {
       }
     };
 
-    poll();
+    // ✅ FIXED: Add initial delay to prevent immediate polling
+    setTimeout(poll, 1000);
 
     const watcher = {
       close: () => {

@@ -105,6 +105,23 @@ export class FilesStore {
     }
   }
 
+  // Add this method to your FilesStore class
+  resetFileModifications(): void {
+    if (typeof window === 'undefined') {
+      console.warn('FilesStore: resetFileModifications called on server-side');
+      return;
+    }
+
+    this.#modifiedFiles.clear();
+    this.#deletedPaths.clear();
+
+    // Reset the files map to initial state
+    this.files.set({});
+    this.#size = 0;
+
+    console.log('FilesStore: File modifications reset');
+  }
+
   #initialize() {
     if (this.#initialized || !this.#dockerClient) {
       return;

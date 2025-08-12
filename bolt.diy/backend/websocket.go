@@ -4,33 +4,24 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
-	"github.com/docker/docker/client"
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true // Allow all origins for development
 	},
 }
 
-// Global container manager variable
+// Global container manager reference
 var containerManager *ContainerManager
 
-// Initialize the container manager
-func init() {
-	// Create Docker client first
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Fatal("Failed to create Docker client:", err)
-	}
-
-	// Create container manager with the Docker client
-	containerManager = NewContainerManager(dockerClient)
-}
-
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade failed: %v", err)
@@ -38,6 +29,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	log.Printf("Client connected: %s", conn.RemoteAddr())
+
+	// Handle WebSocket messages
 	for {
 		var msg struct {
 			MessageID   string `json:"messageId"`
@@ -45,14 +39,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Command     string `json:"command"`
 		}
 
+		// Read JSON message from client
 		if err := conn.ReadJSON(&msg); err != nil {
-			log.Printf("WebSocket read error: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error: %v", err)
+			}
 			break
 		}
 
-		// Now executeCommand will work properly
-		output, err := containerManager.executeCommand(context.Background(), msg.ContainerID, msg.Command)
+		log.Printf("Received command: %s for container: %s", msg.Command, msg.ContainerID)
 
+		// Execute command in Docker container
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		output, err := containerManager.executeCommand(ctx, msg.ContainerID, msg.Command)
+		cancel()
+
+		// Prepare response
 		response := map[string]interface{}{
 			"messageId": msg.MessageID,
 			"type":      "output",
@@ -62,13 +64,27 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			response["type"] = "error"
 			response["data"] = err.Error()
+			log.Printf("Command execution failed: %v", err)
+		}
+
+		// Send response back to client
+		if err := conn.WriteJSON(response); err != nil {
+			log.Printf("Write error: %v", err)
+			break
 		}
 
 		// Send end signal
-		response["type"] = "end"
-		if err := conn.WriteJSON(response); err != nil {
-			log.Printf("WebSocket write error: %v", err)
+		endResponse := map[string]interface{}{
+			"messageId": msg.MessageID,
+			"type":      "end",
+			"data":      "",
+		}
+
+		if err := conn.WriteJSON(endResponse); err != nil {
+			log.Printf("Write end signal error: %v", err)
 			break
 		}
 	}
+
+	log.Printf("Client disconnected: %s", conn.RemoteAddr())
 }
